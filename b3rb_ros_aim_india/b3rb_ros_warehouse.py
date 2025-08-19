@@ -19,6 +19,7 @@ from rclpy.node import Node
 from rclpy.timer import Timer
 from rclpy.action import ActionClient
 from rclpy.parameter import Parameter
+from pyzbar import pyzbar
 
 import math
 import time
@@ -218,6 +219,123 @@ class WarehouseExplore(Node):
 		# --- Shelf Data ---
 		self.shelf_objects_curr = WarehouseShelf()
 
+		self.state = "WAITING_FOR_ROBOT"
+		self.confirmed_shelves = []
+		self.mission_queue = []
+		self.mission_timer = self.create_timer(1.0, self.mission_control_loop)
+		self.current_task = None
+		self.next_heuristic_angle = math.radians(self.initial_angle)
+		self.has_initial_pose = False
+		self.search_step_distance = 1.5
+		self.search_step_taken = 0
+		self.max_search_steps = 5
+		
+
+	def mission_control_loop(self):
+		"""The main brain of the robot. Manages the state machine."""
+
+		# We only make decisions if the robot has no active goal.
+		if not self.goal_completed:
+			return
+
+		self.get_logger().info(f"--- Brain Tick --- State: {self.state}")
+
+		if self.state == "WAITING_FOR_ROBOT":
+			if self.armed and self.has_initial_pose:
+				self.get_logger().info("ROBOT IS READY. Starting Directed Search.")
+				self.state = "SEARCHING"
+				# Immediately call the loop again to process the new SEARCHING state
+				self.mission_control_loop()
+			else:
+				self.get_logger().info(f"Waiting for robot... Armed={self.armed}, Localized={self.has_initial_pose}")
+
+		elif self.state == "SEARCHING":
+			if len(self.confirmed_shelves) > 0:
+				self.get_logger().info(f"!!! SUCCESS! Found a shelf. Mission accomplished for now. !!!")
+				self.state = "IDLE"
+				return
+
+			if self.search_step_taken >= self.max_search_steps:
+				self.get_logger().error("Search failed: Reached max steps without finding a shelf.")
+				self.state = "IDLE"
+				return
+
+			# --- Calculate and send the NEXT incremental goal ---
+			angle_rad = self.next_heuristic_angle
+			
+			goal_x = self.buggy_pose_x + self.search_step_distance * math.cos(angle_rad)
+			goal_y = self.buggy_pose_y + self.search_step_distance * math.sin(angle_rad)
+			
+			self.get_logger().info(f"Search step {self.search_step_taken + 1}/{self.max_search_steps}: "
+								f"Moving towards {self.next_heuristic_angle:.1f} deg.")
+			
+			goal_pose = self.create_goal_from_world_coord(goal_x, goal_y)
+			success = self.send_goal_from_world_pose(goal_pose)
+			
+			if success:
+				self.search_step_taken += 1
+			else:
+				self.get_logger().warn("Failed to send incremental search goal. Will retry on next tick.")
+
+		elif self.state == "IDLE":
+			# The robot is idle, do nothing.
+			pass
+
+	def calculate_shelf_poses(self, shelf_info):
+		"""
+		Calculates all 4 navigation poses for a shelf (front/back for objects, left/right for QR).
+		"""
+		center_x, center_y = shelf_info['center_world']
+		orientation = shelf_info['orientation_rad']
+		perp_orientation = orientation + math.pi / 2
+		
+		offset_dist = 1.0 # How far away from the shelf to stop
+
+		# --- Poses for Object Viewing (Front and Back) ---
+		# Pose 1: Front
+		obj1_x = center_x + offset_dist * math.cos(perp_orientation)
+		obj1_y = center_y + offset_dist * math.sin(perp_orientation)
+		obj1_yaw = perp_orientation + math.pi # Look at shelf
+		object_pose1 = self.create_goal_from_world_coord(obj1_x, obj1_y, obj1_yaw)
+		
+		# Pose 2: Back (offset in the opposite direction)
+		obj2_x = center_x - offset_dist * math.cos(perp_orientation)
+		obj2_y = center_y - offset_dist * math.sin(perp_orientation)
+		obj2_yaw = perp_orientation # Look at shelf
+		object_pose2 = self.create_goal_from_world_coord(obj2_x, obj2_y, obj2_yaw)
+
+		# --- Poses for QR Code Viewing (Left and Right Sides) ---
+		# Pose 1: Right Side
+		qr1_x = center_x + offset_dist * math.cos(orientation)
+		qr1_y = center_y + offset_dist * math.sin(orientation)
+		qr1_yaw = orientation + math.pi # Look at shelf side
+		qr_pose1 = self.create_goal_from_world_coord(qr1_x, qr1_y, qr1_yaw)
+
+		# Pose 2: Left Side
+		qr2_x = center_x - offset_dist * math.cos(orientation)
+		qr2_y = center_y - offset_dist * math.sin(orientation)
+		qr2_yaw = orientation # Look at shelf side
+		qr_pose2 = self.create_goal_from_world_coord(qr2_x, qr2_y, qr2_yaw)
+		
+		return {
+			'object_poses': [object_pose1, object_pose2],
+			'qr_poses': [qr_pose1, qr_pose2]
+		}
+
+	def execute_next_task(self):
+		"""Pops the next task from the queue and sends the goal."""
+		if not self.mission_queue:
+			self.get_logger().info("--- MISSION COMPLETE ---")
+			self.state = "IDLE"
+			return
+			
+		if not self.goal_completed:
+			self.get_logger().warn("Waiting for previous goal to complete.")
+			return
+
+		self.current_task = self.mission_queue.pop(0)
+		self.get_logger().info(f"Executing task: {self.current_task['task_type']} for Shelf {self.current_task['id']}")
+		self.send_goal_from_world_pose(self.current_task['goal_pose'])
 
 
 	def pose_callback(self, message):
@@ -234,20 +352,107 @@ class WarehouseExplore(Node):
 		self.buggy_pose_y = message.pose.pose.position.y
 		self.buggy_center = (self.buggy_pose_x, self.buggy_pose_y)
 
+		if not self.has_initial_pose:
+			self.get_logger().info("<<<<< INITIAL POSE RECEIVED from SLAM. Robot is localized. >>>>>")
+			self.has_initial_pose = True
+
 	def simple_map_callback(self, message):
-		"""Callback function to handle simple map updates.
-
-		Args:
-			message: ROS2 message containing the simple map data.
-
-		Returns:
-			None
+		"""
+		Callback to process the raw map, find shelf-like objects,
+		and merge them to get a stable list of confirmed shelves.
 		"""
 		self.simple_map_curr = message
 		map_info = self.simple_map_curr.info
-		self.world_center = self.get_world_coord_from_map_coord(
-			map_info.width / 2, map_info.height / 2, map_info
-		)
+		
+		# Early exit if map is not ready
+		if map_info.width < 10 or map_info.height < 10:
+			return
+
+		# --- Step 1: Convert map data to a binary image ---
+		map_data = np.array(message.data).reshape((map_info.height, map_info.width))
+		binary_image = np.zeros_like(map_data, dtype=np.uint8)
+		binary_image[map_data == 100] = 255  # Obstacles are white for OpenCV
+
+		# --- Step 2: Find all distinct shapes (contours) ---
+		contours, _ = cv2.findContours(binary_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+		
+		# --- Step 3: Analyze each contour to see if it's a potential shelf ---
+		shelf_dimensions_m = (1.35, 0.5)  # (length, width) in meters
+		resolution = map_info.resolution
+		
+		potential_shelves = []
+		for contour in contours:
+			# --- A) Filter by Area ---
+			area_pixels = cv2.contourArea(contour)
+			if area_pixels < 20:  # Filter out small noise
+				continue
+			
+			area_m2 = area_pixels * (resolution**2)
+			shelf_area_m2 = shelf_dimensions_m[0] * shelf_dimensions_m[1]
+			
+			if not np.isclose(area_m2, shelf_area_m2, atol=0.3):  # Looser tolerance for area
+				continue
+
+			# --- B) Filter by Shape using minAreaRect ---
+			rect = cv2.minAreaRect(contour)
+			(w_pixels, h_pixels) = rect[1]
+			w_m, h_m = w_pixels * resolution, h_pixels * resolution
+			
+			dim1, dim2 = sorted((w_m, h_m))
+			shelf_dim1, shelf_dim2 = sorted(shelf_dimensions_m)
+			
+			if not (np.isclose(dim1, shelf_dim1, atol=0.3) and np.isclose(dim2, shelf_dim2, atol=0.3)):
+				continue
+
+			# --- C) If it passes, it's a potential shelf. Calculate its properties. ---
+			center_pixels = rect[0]
+			world_center = self.get_world_coord_from_map_coord(center_pixels[0], center_pixels[1], map_info)
+			
+			# --- D) Use PCA for robust orientation (as hinted) ---
+			points = contour.reshape(-1, 2).astype(np.float32)
+			pca = PCA(n_components=2)
+			pca.fit(points)
+			angle_rad = np.arctan2(pca.components_[0][1], pca.components_[0][0])
+			
+			# Add this candidate to our list for this callback run
+			potential_shelves.append({
+				'center_world': world_center,
+				'orientation_rad': angle_rad
+			})
+
+		# --- Step 4: Merge potential shelves with our master list of confirmed shelves ---
+		merge_distance_threshold = 0.75  # If centers are within 0.75m, they are the same shelf
+
+		for potential_shelf in potential_shelves:
+			is_new_shelf = True
+			for i, confirmed_shelf in enumerate(self.confirmed_shelves):
+				distance = euclidean(potential_shelf['center_world'], confirmed_shelf['center_world'])
+				
+				if distance < merge_distance_threshold:
+					# This is an update to an existing shelf, not a new one.
+					is_new_shelf = False
+					
+					# Update the existing entry with the new, more current data.
+					# This helps refine the position as the map improves.
+					self.confirmed_shelves[i]['center_world'] = potential_shelf['center_world']
+					self.confirmed_shelves[i]['orientation_rad'] = potential_shelf['orientation_rad']
+					break # Move to the next potential shelf
+
+			if is_new_shelf:
+				# This potential shelf is far from all our confirmed shelves. It's a new discovery!
+				self.get_logger().info(f"!!! NEW SHELF DISCOVERED at {potential_shelf['center_world']} !!!")
+				new_shelf_data = {
+					'id': len(self.confirmed_shelves) + 1,
+					'center_world': potential_shelf['center_world'],
+					'orientation_rad': potential_shelf['orientation_rad']
+				}
+				self.confirmed_shelves.append(new_shelf_data)
+
+		# --- Final Logging ---
+		# Periodically log the state of our confirmed shelves list
+		if len(self.confirmed_shelves) > 0:
+			shelf_positions = [f"ID {s['id']}: ({s['center_world'][0]:.2f}, {s['center_world'][1]:.2f})" for s in self.confirmed_shelves]
+			self.get_logger().info(f"Confirmed Shelves ({len(self.confirmed_shelves)}): {shelf_positions}")
 
 	def global_map_callback(self, message):
 		"""Callback function to handle global map updates.
@@ -258,6 +463,12 @@ class WarehouseExplore(Node):
 		Returns:
 			None
 		"""
+		return
+
+		if self.state != "EXPLORING":
+			return
+
+
 		self.global_map_curr = message
 
 		if not self.goal_completed:
@@ -365,38 +576,97 @@ class WarehouseExplore(Node):
 			publisher.publish(message)
 
 	def camera_image_callback(self, message):
-		"""Callback function to handle incoming camera images.
-
-		Args:
-			message: ROS2 message of the type sensor_msgs.msg.CompressedImage.
-
-		Returns:
-			None
 		"""
+		Callback function to handle incoming camera images.
+		This function now also decodes QR codes using pyzbar.
+		"""
+		# --- Step 1: Decode the compressed ROS message into an OpenCV image ---
 		np_arr = np.frombuffer(message.data, np.uint8)
 		image = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-		# Process the image from front camera as needed.
 
-		# Optional line for visualizing image on foxglove.
-		# self.publish_debug_image(self.publisher_qr_decode, image)
+		# --- Step 2: Decode QR code using pyzbar ---
+		# pyzbar is more efficient and accurate with grayscale images.
+		gray_image = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+		qrcodes = pyzbar.decode(gray_image)
+
+		# --- Step 3: Process the results ---
+		if qrcodes:
+			# Loop through all detected QR codes (though usually there is only one).
+			for qrcode in qrcodes:
+				# Decode the QR data from bytes into a human-readable string.
+				qr_data_string = qrcode.data.decode('utf-8')
+				
+				# Check if this is a NEW QR code we haven't seen before.
+				# This prevents spamming the log with the same message every frame.
+				if qr_data_string != self.qr_code_str:
+					self.qr_code_str = qr_data_string
+					self.get_logger().info(f"!!! NEW QR CODE DETECTED: {self.qr_code_str} !!!")
+
+				# --- (Optional) Draw a box around the QR code for debugging ---
+				(x, y, w, h) = qrcode.rect
+				# Draw a green rectangle around the QR code.
+				cv2.rectangle(image, (x, y), (x + w, y + h), (0, 255, 0), 2) 
+				# Add a label above the box.
+				cv2.putText(image, "QR_DETECTED", (x, y - 10), 
+							cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+
+		# --- Step 4: (Optional but recommended) Publish the debug image ---
+		# This sends the image (with the green box) to Foxglove for visualization.
+		self.publish_debug_image(self.publisher_qr_decode, image)
 
 	def cerebri_status_callback(self, message):
-		"""Callback function to handle cerebri status updates.
-
-		Args:
-			message: ROS2 message containing cerebri status.
-
-		Returns:
-			None
-		"""
+		"""Callback function to handle cerebri status updates."""
+		
+		# Check if the robot is armed and ready
 		if message.mode == 3 and message.arming == 2:
 			self.armed = True
+			# If the robot is armed AND we have NOT created our trigger timer yet...
+			# if self.trigger_timer is None:
+			# 	self.get_logger().info("Robot is ARMED. Starting autonomous sequence in 5 seconds...")
+				
+			# 	# Create the one-shot timer and STORE it
+			# 	self.trigger_timer = self.create_timer(5.0, self.execute_hardcoded_goal_sequence)
 		else:
-			# Initialize and arm the CMD_VEL mode.
+			# If the robot is NOT armed, command it to arm.
+			# self.get_logger().info("Robot is not armed. Requesting arming...") # This can be spammy, maybe comment out
 			msg = Joy()
 			msg.buttons = [0, 1, 0, 0, 0, 0, 0, 1]
 			msg.axes = [0.0, 0.0, 0.0, 0.0]
 			self.publisher_joy.publish(msg)
+
+			# If the timer exists, cancel it because we've been disarmed.
+			# if self.trigger_timer is not None:
+			# 	self.get_logger().warn("Robot disarmed, cancelling sequence trigger.")
+			# 	self.trigger_timer.cancel()
+			# 	self.trigger_timer = None
+
+	def trigger_hardcoded_goal(self):
+		"""This function is called by the timer to safely start the sequence."""
+		self.execute_hardcoded_goal_sequence()
+
+	def execute_hardcoded_goal_sequence(self):
+		"""A one-shot function to send our first hardcoded goal."""
+
+		if self.trigger_timer is not None:
+			self.trigger_timer.cancel()
+			self.trigger_timer = None
+
+		self.get_logger().info("--- EXECUTING HARDCODED GOAL SEQUENCE ---")
+
+		# The coordinates you found by driving manually
+		target_x = -4.381
+		target_y = 1.710
+		target_yaw = 0.77 
+
+		# Use the helper function already in the code to create a proper goal message
+		goal_pose = self.create_goal_from_world_coord(target_x, target_y, target_yaw)
+
+		# Now, send this goal to the navigation system
+		self.get_logger().info(f"Sending hardcoded goal: x={target_x}, y={target_y}, yaw={target_yaw}")
+		success = self.send_goal_from_world_pose(goal_pose)
+
+		if not success:
+			self.get_logger().error("Failed to send goal. Is the action server available?")
 
 	def behavior_tree_log_callback(self, message):
 		"""Alternative method for checking goal status.
@@ -478,9 +748,7 @@ class WarehouseExplore(Node):
 		msg.buttons = [1, 0, 0, 0, 0, 0, 0, 1]
 		msg.axes = [0.0, speed, 0.0, turn]
 		self.publisher_joy.publish(msg)
-
-
-
+		
 	def cancel_goal_callback(self, future):
 		"""
 		Callback function executed after a cancellation request is processed.
@@ -507,23 +775,15 @@ class WarehouseExplore(Node):
 			cancel_future.add_done_callback(self.cancel_goal_callback)
 
 	def goal_result_callback(self, future):
-		"""
-		Callback function executed when the navigation goal reaches a final result.
-
-		Args:
-			future (rclpy.Future): The future that is result of the navigation action.
-		"""
+		"""Callback executed when a goal is done. All it does is update the status."""
 		status = future.result().status
-		# NOTE: Refer https://docs.ros2.org/foxy/api/action_msgs/msg/GoalStatus.html.
+		self.goal_completed = True
+		self.goal_handle_curr = None
 
 		if status == GoalStatus.STATUS_SUCCEEDED:
-			self.logger.info("Goal completed successfully!")
+			self.get_logger().info("Navigation step completed successfully.")
 		else:
-			self.logger.warn(f"Goal failed with status: {status}")
-
-		self.goal_completed = True  # Mark goal as completed.
-		self.goal_handle_curr = None  # Clear goal handle.
-
+			self.get_logger().warn(f"Navigation step failed with status: {status}.")
 	def goal_response_callback(self, future):
 		"""
 		Callback function executed after the goal is sent to the action server.
